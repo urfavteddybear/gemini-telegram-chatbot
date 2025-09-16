@@ -1,0 +1,833 @@
+const { Telegraf, Markup } = require('telegraf');
+const database = require('./services/database');
+const geminiService = require('./services/gemini');
+const conversationService = require('./services/conversation');
+const securityMiddleware = require('./middleware/security');
+
+class TelegramBot {
+  constructor() {
+    this.token = process.env.TELEGRAM_BOT_TOKEN;
+    if (!this.token) {
+      throw new Error('TELEGRAM_BOT_TOKEN is required');
+    }
+
+    this.bot = new Telegraf(this.token);
+    this.setupMiddleware();
+    this.setupCommands();
+    this.setupMessageHandlers();
+    this.setupErrorHandling();
+  }
+
+  setupMiddleware() {
+    // Apply security middleware
+    this.bot.use(securityMiddleware.rateLimitMiddleware.bind(securityMiddleware));
+    this.bot.use(securityMiddleware.validateInputMiddleware.bind(securityMiddleware));
+    this.bot.use(securityMiddleware.commandValidationMiddleware.bind(securityMiddleware));
+
+    // Logging middleware
+    this.bot.use(async (ctx, next) => {
+      const start = Date.now();
+      const userId = ctx.from?.id;
+      const username = ctx.from?.username;
+      const text = ctx.message?.text || '';
+      
+      console.log(`[${new Date().toISOString()}] User ${userId} (${username}): ${text.substring(0, 100)}`);
+      
+      await next();
+      
+      const duration = Date.now() - start;
+      console.log(`Request processed in ${duration}ms`);
+    });
+  }
+
+  setupCommands() {
+    // Start command
+    this.bot.command('start', async (ctx) => {
+      const user = await database.getOrCreateUser(ctx.from);
+      
+      const welcomeMessage = `
+🤖 *Selamat datang di Gemini Chatbot!*
+
+Halo ${ctx.from.first_name}! Saya adalah chatbot yang menggunakan Google Gemini AI untuk membantu Anda.
+
+*Fitur yang tersedia:*
+🧠 Chat dengan AI yang mengingat percakapan
+⚙️ Pilih model AI yang diinginkan
+📝 Atur system prompt personal
+📊 Lihat statistik penggunaan
+🗑️ Hapus riwayat percakapan
+
+*Perintah yang tersedia:*
+/help - Bantuan lengkap
+/models - Lihat model yang tersedia
+/model [nama] - Ganti model AI
+/prompt [teks] - Atur system prompt
+/clear - Hapus riwayat percakapan
+/stats - Lihat statistik Anda
+/settings - Pengaturan akun
+/ping - Cek status bot
+
+Silakan mulai chat dengan mengirim pesan apapun!
+      `;
+
+      await this.sendLongMessage(ctx, welcomeMessage);
+    });
+
+    // Help command
+    this.bot.command('help', async (ctx) => {
+      const helpMessage = `
+📖 *Panduan Penggunaan Gemini Chatbot*
+
+*Cara Chat:*
+• Kirim pesan biasa untuk chat dengan AI
+• AI akan mengingat percakapan sebelumnya
+• Respon AI akan disesuaikan dengan konteks
+
+*Perintah Dasar:*
+/start - Mulai menggunakan bot
+/help - Tampilkan panduan ini
+/ping - Cek status bot dan koneksi
+
+*Pengaturan Model:*
+/models - Lihat semua model tersedia
+/model flash - Gunakan Gemini 1.5 Flash (cepat)
+/model pro - Gunakan Gemini 1.5 Pro (canggih)
+
+*Pengaturan Prompt:*
+/prompt - Lihat system prompt saat ini
+/prompt [teks] - Atur system prompt baru
+/prompt reset - Reset ke prompt default
+
+*Manajemen Data:*
+/clear - Hapus semua riwayat percakapan
+/stats - Lihat statistik penggunaan
+/settings - Pengaturan akun Anda
+
+*Tips:*
+• Bot mengingat 20 pesan terakhir untuk konteks
+• Rate limit: 10 pesan per menit
+• Maksimal 4000 karakter per pesan
+• Gunakan model Flash untuk respon cepat
+• Gunakan model Pro untuk analisis kompleks
+
+Jika ada masalah, coba /ping untuk cek status bot.
+      `;
+
+      await this.sendLongMessage(ctx, helpMessage);
+    });
+
+    // Models command
+    this.bot.command('models', async (ctx) => {
+      const models = geminiService.getAvailableModels();
+      const user = await database.getOrCreateUser(ctx.from);
+      const settings = await database.getUserSettings(user.id);
+      const currentModel = settings?.preferred_model || process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+
+      let message = `🤖 *Model AI yang Tersedia:*\n\n`;
+      
+      models.forEach(model => {
+        const isCurrent = model.name === currentModel ? '✅ ' : '';
+        message += `${isCurrent}*${model.name}*\n${model.description}\n\n`;
+      });
+
+      message += `*Model saat ini:* ${currentModel}\n\n`;
+      message += `Untuk mengganti model, gunakan:\n/model [nama_model]`;
+
+      await this.sendLongMessage(ctx, message);
+    });
+
+    // Model command
+    this.bot.command('model', async (ctx) => {
+      const args = ctx.message.text.split(' ').slice(1);
+      
+      if (args.length === 0) {
+        const user = await database.getOrCreateUser(ctx.from);
+        const settings = await database.getUserSettings(user.id);
+        const currentModel = settings?.preferred_model || process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+        
+        await ctx.reply(`Model saat ini: *${currentModel}*\n\nGunakan /models untuk melihat pilihan model.`, { parse_mode: 'Markdown' });
+        return;
+      }
+
+      const modelName = args.join(' ').toLowerCase();
+      const modelMap = {
+        'flash': 'gemini-1.5-flash',
+        'pro': 'gemini-1.5-pro',
+        '1.0': 'gemini-1.0-pro',
+        'gemini-1.5-flash': 'gemini-1.5-flash',
+        'gemini-1.5-pro': 'gemini-1.5-pro',
+        'gemini-1.0-pro': 'gemini-1.0-pro'
+      };
+
+      const selectedModel = modelMap[modelName];
+      
+      if (!selectedModel || !geminiService.isValidModel(selectedModel)) {
+        await ctx.reply('❌ Model tidak valid. Gunakan /models untuk melihat model yang tersedia.');
+        return;
+      }
+
+      const user = await database.getOrCreateUser(ctx.from);
+      await database.updateUserSettings(user.id, { preferred_model: selectedModel });
+
+      await ctx.reply(`✅ Model berhasil diubah ke *${selectedModel}*`, { parse_mode: 'Markdown' });
+    });
+
+    // Prompt command
+    this.bot.command('prompt', async (ctx) => {
+      const args = ctx.message.text.split(' ').slice(1);
+      const user = await database.getOrCreateUser(ctx.from);
+
+      if (args.length === 0) {
+        const settings = await database.getUserSettings(user.id);
+        const currentPrompt = settings?.system_prompt || process.env.SYSTEM_PROMPT || 'You are a helpful AI assistant.';
+        
+        await this.sendLongMessage(ctx, `📝 *System Prompt saat ini:*\n\n\`${currentPrompt}\`\n\nGunakan /prompt [teks] untuk mengubah atau /prompt reset untuk reset.`);
+        return;
+      }
+
+      if (args[0].toLowerCase() === 'reset') {
+        await database.updateUserSettings(user.id, { system_prompt: null });
+        await ctx.reply('✅ System prompt berhasil direset ke default.');
+        return;
+      }
+
+      const newPrompt = args.join(' ');
+      if (newPrompt.length > 500) {
+        await ctx.reply('❌ System prompt terlalu panjang. Maksimal 500 karakter.');
+        return;
+      }
+
+      await database.updateUserSettings(user.id, { system_prompt: newPrompt });
+      await ctx.reply('✅ System prompt berhasil diubah.');
+    });
+
+    // Clear command
+    this.bot.command('clear', async (ctx) => {
+      const user = await database.getOrCreateUser(ctx.from);
+      const success = await conversationService.clearConversationHistory(user.id);
+      
+      if (success) {
+        await ctx.reply('🗑️ Riwayat percakapan berhasil dihapus. Percakapan baru akan dimulai tanpa konteks sebelumnya.');
+      } else {
+        await ctx.reply('❌ Gagal menghapus riwayat percakapan. Silakan coba lagi.');
+      }
+    });
+
+    // Stats command
+    this.bot.command('stats', async (ctx) => {
+      const user = await database.getOrCreateUser(ctx.from);
+      const summary = await conversationService.getConversationSummary(user.id);
+      const stats = await conversationService.getConversationStats(user.id);
+      const settings = await database.getUserSettings(user.id);
+
+      if (!summary || summary.messageCount === 0) {
+        await ctx.reply('📊 Belum ada percakapan. Mulai chat untuk melihat statistik!');
+        return;
+      }
+
+      let message = `📊 *Statistik Anda:*\n\n`;
+      message += `💬 Total pesan: ${summary.messageCount}\n`;
+      message += `📅 Interaksi pertama: ${new Date(summary.firstInteraction).toLocaleDateString('id-ID')}\n`;
+      message += `🕐 Interaksi terakhir: ${new Date(summary.lastInteraction).toLocaleDateString('id-ID')}\n\n`;
+
+      if (stats && stats.modelUsage.length > 0) {
+        message += `🤖 *Penggunaan Model:*\n`;
+        stats.modelUsage.forEach(usage => {
+          message += `• ${usage.model}: ${usage.count} (${usage.percentage}%)\n`;
+        });
+        message += `\n`;
+      }
+
+      const currentModel = settings?.preferred_model || process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+      const currentPrompt = settings?.system_prompt ? 'Custom' : 'Default';
+      
+      message += `⚙️ *Pengaturan Saat Ini:*\n`;
+      message += `• Model: ${currentModel}\n`;
+      message += `• System Prompt: ${currentPrompt}`;
+
+      await this.sendLongMessage(ctx, message);
+    });
+
+    // Settings command
+    this.bot.command('settings', async (ctx) => {
+      const user = await database.getOrCreateUser(ctx.from);
+      const settings = await database.getUserSettings(user.id);
+      
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('🤖 Ubah Model', 'settings_model')],
+        [Markup.button.callback('📝 Ubah Prompt', 'settings_prompt')],
+        [Markup.button.callback('🗑️ Hapus Riwayat', 'settings_clear')],
+        [Markup.button.callback('📊 Lihat Stats', 'settings_stats')]
+      ]);
+
+      const currentModel = settings?.preferred_model || process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+      const promptType = settings?.system_prompt ? 'Custom' : 'Default';
+
+      const message = `⚙️ *Pengaturan Akun*\n\n` +
+                     `🤖 Model: ${currentModel}\n` +
+                     `📝 System Prompt: ${promptType}\n` +
+                     `👤 User ID: ${user.id}\n\n` +
+                     `Pilih pengaturan yang ingin diubah:`;
+
+      await this.sendLongMessage(ctx, message, { reply_markup: keyboard.reply_markup });
+    });
+
+    // Ping command
+    this.bot.command('ping', async (ctx) => {
+      const start = Date.now();
+      const healthCheck = await geminiService.healthCheck();
+      const dbStats = await database.getStats();
+      const securityStats = securityMiddleware.getSecurityStats();
+      const ping = Date.now() - start;
+
+      const message = `🏓 *Status Bot*\n\n` +
+                     `⚡ Ping: ${ping}ms\n` +
+                     `🤖 Gemini API: ${healthCheck.status === 'healthy' ? '✅' : '❌'}\n` +
+                     `💾 Database: ✅ Connected\n` +
+                     `👥 Total Users: ${dbStats.users}\n` +
+                     `💬 Total Messages: ${dbStats.totalMessages}\n` +
+                     `📅 Today Messages: ${dbStats.todayMessages}\n` +
+                     `🔒 Blocked Users: ${securityStats.blockedUsers}`;
+
+      await this.sendLongMessage(ctx, message);
+    });
+
+    // Admin command (if user is admin)
+    this.bot.command('admin', async (ctx) => {
+      if (!securityMiddleware.isAdmin(ctx.from.id)) {
+        await ctx.reply('❌ Anda tidak memiliki akses admin.');
+        return;
+      }
+
+      const stats = await database.getStats();
+      const securityStats = securityMiddleware.getSecurityStats();
+      const conversationStats = conversationService.getActiveConversationStats();
+
+      const message = `👑 *Admin Panel*\n\n` +
+                     `📊 *Statistik Sistem:*\n` +
+                     `👥 Users: ${stats.users}\n` +
+                     `💬 Total Messages: ${stats.totalMessages}\n` +
+                     `📅 Today: ${stats.todayMessages}\n\n` +
+                     `🔒 *Keamanan:*\n` +
+                     `🚫 Blocked: ${securityStats.blockedUsers}\n` +
+                     `👑 Admins: ${securityStats.adminUsers}\n\n` +
+                     `💾 *Cache:*\n` +
+                     `🔄 Active: ${conversationStats.activeCacheEntries}`;
+
+      await this.sendLongMessage(ctx, message);
+    });
+  }
+
+  setupMessageHandlers() {
+    // Handle regular text messages
+    this.bot.on('text', async (ctx) => {
+      // Skip if it's a command
+      if (ctx.message.text.startsWith('/')) {
+        return;
+      }
+
+      const user = await database.getOrCreateUser(ctx.from);
+      const userMessage = securityMiddleware.sanitizeInput(ctx.message.text);
+
+      try {
+        // Show typing indicator
+        await ctx.sendChatAction('typing');
+
+        // Get user settings
+        const settings = await database.getUserSettings(user.id);
+        const preferredModel = settings?.preferred_model || process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+        const systemPrompt = settings?.system_prompt || null;
+        const maxContext = settings?.max_context_messages || parseInt(process.env.MAX_CONTEXT_MESSAGES) || 20;
+
+        // Get conversation history
+        const conversationHistory = await conversationService.getRecentContextForAI(user.id, maxContext);
+
+        // Generate response
+        const result = await geminiService.generateResponse(userMessage, {
+          model: preferredModel,
+          systemPrompt: systemPrompt,
+          conversationHistory: conversationHistory,
+          userId: user.id
+        });
+
+        if (!result.success) {
+          await ctx.reply(`❌ ${result.text}`);
+          return;
+        }
+
+        // Save conversation
+        await conversationService.saveConversation(user.id, userMessage, result.text, result.model);
+
+        // Send response (split if too long)
+        await this.sendLongMessage(ctx, result.text);
+
+      } catch (error) {
+        console.error('Error processing message:', error);
+        await ctx.reply('❌ Maaf, terjadi kesalahan saat memproses pesan Anda. Silakan coba lagi.');
+      }
+    });
+
+    // Handle callback queries (inline buttons)
+    this.bot.on('callback_query', async (ctx) => {
+      const action = ctx.callbackQuery.data;
+
+      await ctx.answerCbQuery();
+
+      switch (action) {
+        case 'settings_model':
+          await ctx.reply('Gunakan perintah /models untuk melihat dan /model [nama] untuk mengganti model.');
+          break;
+        case 'settings_prompt':
+          await ctx.reply('Gunakan /prompt untuk melihat dan /prompt [teks] untuk mengubah system prompt.');
+          break;
+        case 'settings_clear':
+          await ctx.reply('Gunakan /clear untuk menghapus riwayat percakapan.');
+          break;
+        case 'settings_stats':
+          await ctx.reply('Gunakan /stats untuk melihat statistik penggunaan.');
+          break;
+      }
+    });
+  }
+
+  setupErrorHandling() {
+    this.bot.catch((err, ctx) => {
+      console.error('Bot error:', err);
+      
+      if (ctx && ctx.reply) {
+        ctx.reply('❌ Terjadi kesalahan sistem. Tim teknis telah diberitahu.')
+          .catch(console.error);
+      }
+    });
+
+    // Handle graceful shutdown
+    process.once('SIGINT', () => this.stop('SIGINT'));
+    process.once('SIGTERM', () => this.stop('SIGTERM'));
+  }
+
+  // Method untuk mengirim pesan panjang yang dipecah otomatis
+  async sendLongMessage(ctx, text, options = {}) {
+    const maxLength = 4000; // Sedikit di bawah limit 4096 untuk safety
+    
+    // Pisahkan keyboard/markup dari options
+    const { reply_markup, ...textOptions } = options;
+    const defaultOptions = { 
+      disable_web_page_preview: true,
+      ...textOptions 
+    };
+
+    // Cek apakah text mungkin memiliki markdown yang bermasalah
+    const hasProblematicMarkdown = this.hasProblematicMarkdown(text);
+
+    // Jika pesan tidak terlalu panjang, kirim biasa
+    if (text.length <= maxLength) {
+      try {
+        const finalOptions = reply_markup ? { ...defaultOptions, reply_markup } : defaultOptions;
+        
+        if (hasProblematicMarkdown) {
+          // Coba bersihkan dulu sebelum fallback
+          try {
+            const cleanedText = this.cleanMarkdown(text);
+            await ctx.reply(cleanedText, { ...finalOptions, parse_mode: 'Markdown' });
+          } catch (cleanError) {
+            console.log('Cleaned markdown still failed, sending as plain text');
+            const plainText = this.markdownToPlainText(text);
+            await ctx.reply(plainText, finalOptions);
+          }
+        } else {
+          // Coba dengan Markdown dulu
+          try {
+            await ctx.reply(text, { ...finalOptions, parse_mode: 'Markdown' });
+          } catch (markdownError) {
+            console.log('Markdown parsing failed, trying to clean first');
+            try {
+              const cleanedText = this.cleanMarkdown(text);
+              await ctx.reply(cleanedText, { ...finalOptions, parse_mode: 'Markdown' });
+            } catch (cleanError) {
+              console.log('Cleaned markdown still failed, sending as plain text');
+              const plainText = this.markdownToPlainText(text);
+              await ctx.reply(plainText, finalOptions);
+            }
+          }
+        }
+        return;
+      } catch (error) {
+        console.error('Error sending message:', error);
+        await ctx.reply('❌ Terjadi kesalahan saat mengirim pesan.');
+        return;
+      }
+    }
+
+    // Split pesan panjang dengan mempertahankan format
+    const chunks = this.splitLongMessage(text, maxLength);
+    
+    for (let i = 0; i < chunks.length; i++) {
+      try {
+        let chunkText = chunks[i];
+        
+        // Tambahkan indikator jika ada multiple chunks
+        if (chunks.length > 1) {
+          if (i === 0) {
+            chunkText = `${chunkText}\n\n_📄 Pesan dilanjutkan..._`;
+          } else if (i === chunks.length - 1) {
+            chunkText = `_📄 ...lanjutan pesan_\n\n${chunkText}`;
+          } else {
+            chunkText = `_📄 ...lanjutan pesan_\n\n${chunkText}\n\n_📄 Pesan dilanjutkan..._`;
+          }
+        }
+
+        // Tambahkan keyboard hanya di chunk terakhir
+        const finalOptions = (i === chunks.length - 1 && reply_markup) 
+          ? { ...defaultOptions, reply_markup } 
+          : defaultOptions;
+
+        // Cek markdown di chunk ini
+        const chunkHasProblematic = this.hasProblematicMarkdown(chunkText);
+        
+        if (chunkHasProblematic) {
+          // Coba bersihkan dulu sebelum fallback
+          try {
+            const cleanedChunk = this.cleanMarkdown(chunkText);
+            await ctx.reply(cleanedChunk, { ...finalOptions, parse_mode: 'Markdown' });
+          } catch (cleanError) {
+            console.log(`Cleaned markdown still failed for chunk ${i + 1}, sending as plain text`);
+            const plainText = this.markdownToPlainText(chunkText);
+            await ctx.reply(plainText, finalOptions);
+          }
+        } else {
+          // Coba markdown dulu
+          try {
+            await ctx.reply(chunkText, { ...finalOptions, parse_mode: 'Markdown' });
+          } catch (markdownError) {
+            console.log(`Markdown parsing failed for chunk ${i + 1}, trying to clean first`);
+            try {
+              const cleanedChunk = this.cleanMarkdown(chunkText);
+              await ctx.reply(cleanedChunk, { ...finalOptions, parse_mode: 'Markdown' });
+            } catch (cleanError) {
+              console.log(`Cleaned markdown still failed for chunk ${i + 1}, sending as plain text`);
+              const plainText = this.markdownToPlainText(chunkText);
+              await ctx.reply(plainText, finalOptions);
+            }
+          }
+        }
+        
+        // Delay kecil antar pesan untuk avoid rate limiting
+        if (i < chunks.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      } catch (error) {
+        console.error(`Error sending chunk ${i + 1}:`, error);
+        await ctx.reply(`❌ Terjadi kesalahan saat mengirim bagian ${i + 1} dari pesan.`);
+        break;
+      }
+    }
+  }
+
+  // Method untuk memecah pesan dengan mempertahankan format markdown
+  splitLongMessage(text, maxLength) {
+    const chunks = [];
+    
+    // Jika text pendek, return as is
+    if (text.length <= maxLength) {
+      return [text];
+    }
+    
+    // Coba split berdasarkan paragraf dulu (double newline)
+    const paragraphs = text.split('\n\n');
+    let currentChunk = '';
+    
+    for (const paragraph of paragraphs) {
+      const potentialChunk = currentChunk ? currentChunk + '\n\n' + paragraph : paragraph;
+      
+      if (potentialChunk.length <= maxLength) {
+        currentChunk = potentialChunk;
+      } else {
+        // Simpan chunk saat ini jika ada
+        if (currentChunk.trim()) {
+          chunks.push(currentChunk.trim());
+        }
+        
+        // Jika paragraph terlalu panjang, split berdasarkan kalimat
+        if (paragraph.length > maxLength) {
+          const splitParagraph = this.splitParagraph(paragraph, maxLength);
+          chunks.push(...splitParagraph);
+          currentChunk = '';
+        } else {
+          currentChunk = paragraph;
+        }
+      }
+    }
+    
+    // Tambahkan chunk terakhir
+    if (currentChunk.trim()) {
+      chunks.push(currentChunk.trim());
+    }
+    
+    return chunks.length > 0 ? chunks : [text];
+  }
+
+  // Helper method untuk split paragraph panjang
+  splitParagraph(paragraph, maxLength) {
+    const chunks = [];
+    
+    // Split berdasarkan kalimat (. ! ?)
+    const sentences = paragraph.split(/(?<=[.!?])\s+/);
+    let currentChunk = '';
+    
+    for (const sentence of sentences) {
+      const potentialChunk = currentChunk ? currentChunk + ' ' + sentence : sentence;
+      
+      if (potentialChunk.length <= maxLength) {
+        currentChunk = potentialChunk;
+      } else {
+        // Simpan chunk saat ini
+        if (currentChunk.trim()) {
+          chunks.push(currentChunk.trim());
+        }
+        
+        // Jika kalimat terlalu panjang, split berdasarkan kata
+        if (sentence.length > maxLength) {
+          const splitSentence = this.splitSentence(sentence, maxLength);
+          chunks.push(...splitSentence);
+          currentChunk = '';
+        } else {
+          currentChunk = sentence;
+        }
+      }
+    }
+    
+    // Tambahkan chunk terakhir
+    if (currentChunk.trim()) {
+      chunks.push(currentChunk.trim());
+    }
+    
+    return chunks;
+  }
+
+  // Helper method untuk split kalimat panjang berdasarkan kata
+  splitSentence(sentence, maxLength) {
+    const chunks = [];
+    const words = sentence.split(' ');
+    let currentChunk = '';
+    
+    for (const word of words) {
+      const potentialChunk = currentChunk ? currentChunk + ' ' + word : word;
+      
+      if (potentialChunk.length <= maxLength) {
+        currentChunk = potentialChunk;
+      } else {
+        // Simpan chunk saat ini
+        if (currentChunk.trim()) {
+          chunks.push(currentChunk.trim());
+        }
+        
+        // Jika kata terlalu panjang, potong paksa
+        if (word.length > maxLength) {
+          let remainingWord = word;
+          while (remainingWord.length > maxLength) {
+            chunks.push(remainingWord.substring(0, maxLength));
+            remainingWord = remainingWord.substring(maxLength);
+          }
+          currentChunk = remainingWord;
+        } else {
+          currentChunk = word;
+        }
+      }
+    }
+    
+    // Tambahkan chunk terakhir
+    if (currentChunk.trim()) {
+      chunks.push(currentChunk.trim());
+    }
+    
+    return chunks;
+  }
+
+  // Helper method untuk membersihkan markdown yang rusak
+  cleanMarkdown(text) {
+    // Strategi: preserve code blocks, bersihkan yang lain
+    let cleaned = text;
+    
+    // Lindungi code blocks dulu
+    const codeBlocks = [];
+    const inlineCodeBlocks = [];
+    
+    // Simpan code blocks (```)
+    cleaned = cleaned.replace(/```[\s\S]*?```/g, (match, index) => {
+      codeBlocks.push(match);
+      return `__CODE_BLOCK_${codeBlocks.length - 1}__`;
+    });
+    
+    // Simpan inline code (`)
+    cleaned = cleaned.replace(/`([^`\n]+?)`/g, (match, content) => {
+      inlineCodeBlocks.push(match);
+      return `__INLINE_CODE_${inlineCodeBlocks.length - 1}__`;
+    });
+    
+    // Sekarang bersihkan markdown yang bermasalah
+    // Hapus bold yang tidak lengkap
+    cleaned = cleaned.replace(/\*\*([^*]*?)\*(?!\*)/g, '**$1**');
+    cleaned = cleaned.replace(/\*(?!\*)([^*]*?)\*\*/g, '**$1**');
+    cleaned = cleaned.replace(/\*\*\s*\*\*/g, '');
+    
+    // Hapus italic yang tidak lengkap (tapi hati-hati dengan yang valid)
+    cleaned = cleaned.replace(/(?<!\*)\*([^*\n]+?)\*(?!\*)/g, (match, content) => {
+      // Pastikan tidak ada * lain di dalam content
+      if (content.includes('*')) {
+        return content; // Hapus * jika bermasalah
+      }
+      return match; // Keep yang valid
+    });
+    
+    // Hapus single * di awal/akhir baris yang tidak berpasangan
+    cleaned = cleaned.replace(/^\*(?!\*)/gm, '');
+    cleaned = cleaned.replace(/(?<!\*)\*$/gm, '');
+    
+    // Hapus underscore yang tidak berpasangan
+    cleaned = cleaned.replace(/^_(?!_)/gm, '');
+    cleaned = cleaned.replace(/(?<!_)_$/gm, '');
+    
+    // Bersihkan bracket yang tidak lengkap
+    cleaned = cleaned.replace(/\[([^\]]*?)$/gm, '$1');
+    cleaned = cleaned.replace(/^([^\[]*?)\]/gm, '$1');
+    
+    // Kembalikan code blocks
+    inlineCodeBlocks.forEach((code, index) => {
+      cleaned = cleaned.replace(`__INLINE_CODE_${index}__`, code);
+    });
+    
+    codeBlocks.forEach((code, index) => {
+      cleaned = cleaned.replace(`__CODE_BLOCK_${index}__`, code);
+    });
+    
+    return cleaned;
+  }
+
+  // Helper method untuk deteksi markdown yang bermasalah
+  hasProblematicMarkdown(text) {
+    // Hapus code blocks dulu dari analisis
+    let textToAnalyze = text;
+    
+    // Hapus code blocks (```) dari analisis
+    textToAnalyze = textToAnalyze.replace(/```[\s\S]*?```/g, '');
+    
+    // Hapus inline code (`) dari analisis
+    textToAnalyze = textToAnalyze.replace(/`[^`\n]+?`/g, '');
+    
+    // Sekarang cek markdown yang tersisa
+    
+    // Cek asterisk yang tidak berpasangan untuk bold/italic (skip yang di dalam code)
+    const asteriskMatches = textToAnalyze.match(/\*/g);
+    if (asteriskMatches) {
+      // Hitung bold vs italic
+      const boldMatches = textToAnalyze.match(/\*\*/g);
+      const boldCount = boldMatches ? boldMatches.length : 0;
+      const totalAsterisk = asteriskMatches.length;
+      const italicAsterisk = totalAsterisk - (boldCount * 2);
+      
+      // Bold harus genap, italic harus genap
+      if (boldCount % 2 !== 0 || italicAsterisk % 2 !== 0) {
+        return true;
+      }
+    }
+    
+    // Cek underscore yang tidak berpasangan
+    const underscoreMatches = textToAnalyze.match(/(?<!\w)_(?!\w)|(?!\w)_(?=\w)/g);
+    if (underscoreMatches && underscoreMatches.length % 2 !== 0) {
+      return true;
+    }
+    
+    // Cek bracket yang tidak lengkap untuk link
+    const openBrackets = (textToAnalyze.match(/\[/g) || []).length;
+    const closeBrackets = (textToAnalyze.match(/\]/g) || []).length;
+    if (openBrackets !== closeBrackets) {
+      return true;
+    }
+    
+    // Cek parentheses yang tidak lengkap untuk link
+    const linkPattern = /\[([^\]]*)\]\([^)]*\)/g;
+    const links = textToAnalyze.match(linkPattern) || [];
+    const openParensInLinks = links.join('').match(/\(/g) || [];
+    const closeParensInLinks = links.join('').match(/\)/g) || [];
+    
+    const totalOpenParens = (textToAnalyze.match(/\(/g) || []).length;
+    const totalCloseParens = (textToAnalyze.match(/\)/g) || []).length;
+    
+    // Hanya bermasalah jika ada paren yang tidak tertutup di luar link
+    if (totalOpenParens !== totalCloseParens) {
+      return true;
+    }
+    
+    return false;
+  }
+
+  // Helper method untuk konversi markdown ke plain text
+  markdownToPlainText(text) {
+    return text
+      .replace(/```(\w+)?\n?([\s\S]*?)```/g, '「CODE」\n$2\n「/CODE」') // Code block dengan pembatas
+      .replace(/`([^`\n]+?)`/g, '〖$1〗')       // Inline code dengan bracket
+      .replace(/\*\*(.*?)\*\*/g, '【$1】')     // Bold dengan bracket tebal
+      .replace(/\*(.*?)\*/g, '$1')             // Italic hilang
+      .replace(/_(.*?)_/g, '$1')               // Italic underscore hilang
+      .replace(/\[(.*?)\]\(.*?\)/g, '🔗$1')    // Links dengan emoji
+      .replace(/^#+\s*/gm, '▶ ')               // Headers dengan arrow
+      .replace(/^\>\s*/gm, '💬 ')              // Quotes dengan emoji
+      .replace(/^\*\s*/gm, '• ')               // Bullet points
+      .replace(/^\d+\.\s*/gm, '◯ ')            // Numbered lists dengan circle
+      .replace(/\n{3,}/g, '\n\n');             // Multiple newlines
+  }
+
+  async start() {
+    try {
+      console.log('Starting Telegram bot...');
+      
+      // Initialize database
+      await database.initialize();
+      
+      // Test Gemini connection
+      const healthCheck = await geminiService.healthCheck();
+      if (healthCheck.status !== 'healthy') {
+        throw new Error('Gemini API health check failed');
+      }
+
+      // Start bot
+      if (process.env.WEBHOOK_URL) {
+        // Use webhook mode for production
+        const port = process.env.PORT || 3000;
+        await this.bot.launch({
+          webhook: {
+            domain: process.env.WEBHOOK_URL,
+            port: port,
+            secretToken: process.env.WEBHOOK_SECRET
+          }
+        });
+        console.log(`Bot started with webhook on port ${port}`);
+      } else {
+        // Use polling mode for development
+        await this.bot.launch();
+        console.log('Bot started with polling');
+      }
+
+      console.log('✅ Telegram bot is running successfully!');
+    } catch (error) {
+      console.error('Failed to start bot:', error);
+      process.exit(1);
+    }
+  }
+
+  async stop(signal) {
+    console.log(`Received ${signal}, shutting down gracefully...`);
+    
+    try {
+      await this.bot.stop(signal);
+      await database.close();
+      console.log('Bot stopped successfully');
+      process.exit(0);
+    } catch (error) {
+      console.error('Error during shutdown:', error);
+      process.exit(1);
+    }
+  }
+}
+
+module.exports = TelegramBot;

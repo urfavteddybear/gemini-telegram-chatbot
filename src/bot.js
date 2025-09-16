@@ -407,7 +407,7 @@ Jika ada masalah, coba /ping untuk cek status bot.
 
   // Method untuk mengirim pesan panjang yang dipecah otomatis
   async sendLongMessage(ctx, text, options = {}) {
-    const maxLength = 4000; // Sedikit di bawah limit 4096 untuk safety
+    const maxLength = 2000; // Lebih agresif: kurangi dari 2800 ke 2000 untuk lebih banyak chunks
     
     // Pisahkan keyboard/markup dari options
     const { reply_markup, ...textOptions } = options;
@@ -418,6 +418,8 @@ Jika ada masalah, coba /ping untuk cek status bot.
 
     // Cek apakah text mungkin memiliki markdown yang bermasalah
     const hasProblematicMarkdown = this.hasProblematicMarkdown(text);
+
+    console.log(`Message length: ${text.length}, will split: ${text.length > maxLength}`);
 
     // Jika pesan tidak terlalu panjang, kirim biasa
     if (text.length <= maxLength) {
@@ -460,6 +462,8 @@ Jika ada masalah, coba /ping untuk cek status bot.
 
     // Split pesan panjang dengan mempertahankan format
     const chunks = this.splitLongMessage(text, maxLength);
+    
+    console.log(`Split into ${chunks.length} chunks:`, chunks.map(c => c.length));
     
     for (let i = 0; i < chunks.length; i++) {
       try {
@@ -524,7 +528,7 @@ Jika ada masalah, coba /ping untuk cek status bot.
   }
 
   // Method untuk memecah pesan dengan mempertahankan format markdown
-  splitLongMessage(text, maxLength) {
+  splitLongMessage(text, maxLength = 2000) {
     const chunks = [];
     
     // Jika text pendek, return as is
@@ -532,25 +536,50 @@ Jika ada masalah, coba /ping untuk cek status bot.
       return [text];
     }
     
+    console.log(`Splitting text of length ${text.length} with maxLength ${maxLength}`);
+    
+    // Protect code blocks dulu sebelum split
+    const codeBlocks = [];
+    let textWithPlaceholders = text;
+    
+    // Extract code blocks (```) dan replace dengan placeholder
+    textWithPlaceholders = textWithPlaceholders.replace(/```[\s\S]*?```/g, (match) => {
+      codeBlocks.push(match);
+      return `___CODE_BLOCK_${codeBlocks.length - 1}___`;
+    });
+    
+    // Extract inline code (`) dan replace dengan placeholder  
+    const inlineCodeBlocks = [];
+    textWithPlaceholders = textWithPlaceholders.replace(/`([^`\n]+?)`/g, (match) => {
+      inlineCodeBlocks.push(match);
+      return `___INLINE_CODE_${inlineCodeBlocks.length - 1}___`;
+    });
+    
     // Coba split berdasarkan paragraf dulu (double newline)
-    const paragraphs = text.split('\n\n');
+    const paragraphs = textWithPlaceholders.split('\n\n');
     let currentChunk = '';
     
-    for (const paragraph of paragraphs) {
+    for (let i = 0; i < paragraphs.length; i++) {
+      const paragraph = paragraphs[i];
       const potentialChunk = currentChunk ? currentChunk + '\n\n' + paragraph : paragraph;
       
-      if (potentialChunk.length <= maxLength) {
+      // Lebih agresif: jika potentialChunk > 80% maxLength, split
+      if (potentialChunk.length <= maxLength * 0.8) {
         currentChunk = potentialChunk;
       } else {
         // Simpan chunk saat ini jika ada
         if (currentChunk.trim()) {
           chunks.push(currentChunk.trim());
+          console.log(`Added paragraph chunk: ${currentChunk.length} chars`);
         }
         
-        // Jika paragraph terlalu panjang, split berdasarkan kalimat
-        if (paragraph.length > maxLength) {
+        // Jika paragraph sendiri > 60% maxLength, split berdasarkan kalimat
+        if (paragraph.length > maxLength * 0.6) {
           const splitParagraph = this.splitParagraph(paragraph, maxLength);
           chunks.push(...splitParagraph);
+          splitParagraph.forEach((chunk, idx) => {
+            console.log(`Added split paragraph chunk ${idx}: ${chunk.length} chars`);
+          });
           currentChunk = '';
         } else {
           currentChunk = paragraph;
@@ -561,9 +590,58 @@ Jika ada masalah, coba /ping untuk cek status bot.
     // Tambahkan chunk terakhir
     if (currentChunk.trim()) {
       chunks.push(currentChunk.trim());
+      console.log(`Added final chunk: ${currentChunk.length} chars`);
     }
     
-    return chunks.length > 0 ? chunks : [text];
+    // Kalau masih belum cukup terpecah, paksa split lebih agresif
+    if (chunks.length === 1 && chunks[0].length > maxLength) {
+      console.log('Force splitting single large chunk');
+      const forceSplit = this.forceSplit(chunks[0], maxLength);
+      // Restore code blocks di force split
+      const restoredForceSplit = forceSplit.map(chunk => {
+        let restored = chunk;
+        inlineCodeBlocks.forEach((code, index) => {
+          restored = restored.replace(new RegExp(`___INLINE_CODE_${index}___`, 'g'), code);
+        });
+        codeBlocks.forEach((code, index) => {
+          restored = restored.replace(new RegExp(`___CODE_BLOCK_${index}___`, 'g'), code);
+        });
+        return restored;
+      });
+      return restoredForceSplit;
+    }
+    
+    // Validasi setiap chunk tidak melebihi maxLength
+    const validatedChunks = [];
+    for (const chunk of chunks) {
+      if (chunk.length > maxLength) {
+        console.log(`Chunk too large (${chunk.length}), force splitting`);
+        validatedChunks.push(...this.forceSplit(chunk, maxLength));
+      } else {
+        validatedChunks.push(chunk);
+      }
+    }
+    
+    console.log(`Final result: ${validatedChunks.length} chunks`);
+    
+    // Restore code blocks di semua chunks
+    const restoredChunks = validatedChunks.map(chunk => {
+      let restored = chunk;
+      
+      // Restore inline code blocks
+      inlineCodeBlocks.forEach((code, index) => {
+        restored = restored.replace(new RegExp(`___INLINE_CODE_${index}___`, 'g'), code);
+      });
+      
+      // Restore code blocks
+      codeBlocks.forEach((code, index) => {
+        restored = restored.replace(new RegExp(`___CODE_BLOCK_${index}___`, 'g'), code);
+      });
+      
+      return restored;
+    });
+    
+    return restoredChunks.length > 0 ? restoredChunks : [text];
   }
 
   // Helper method untuk split paragraph panjang
@@ -577,7 +655,8 @@ Jika ada masalah, coba /ping untuk cek status bot.
     for (const sentence of sentences) {
       const potentialChunk = currentChunk ? currentChunk + ' ' + sentence : sentence;
       
-      if (potentialChunk.length <= maxLength) {
+      // Lebih agresif: jika > 70% maxLength, split
+      if (potentialChunk.length <= maxLength * 0.7) {
         currentChunk = potentialChunk;
       } else {
         // Simpan chunk saat ini
@@ -586,7 +665,7 @@ Jika ada masalah, coba /ping untuk cek status bot.
         }
         
         // Jika kalimat terlalu panjang, split berdasarkan kata
-        if (sentence.length > maxLength) {
+        if (sentence.length > maxLength * 0.5) {
           const splitSentence = this.splitSentence(sentence, maxLength);
           chunks.push(...splitSentence);
           currentChunk = '';
@@ -613,7 +692,8 @@ Jika ada masalah, coba /ping untuk cek status bot.
     for (const word of words) {
       const potentialChunk = currentChunk ? currentChunk + ' ' + word : word;
       
-      if (potentialChunk.length <= maxLength) {
+      // Batas 60% dari maxLength untuk kata-kata
+      if (potentialChunk.length <= maxLength * 0.6) {
         currentChunk = potentialChunk;
       } else {
         // Simpan chunk saat ini
@@ -622,15 +702,76 @@ Jika ada masalah, coba /ping untuk cek status bot.
         }
         
         // Jika kata terlalu panjang, potong paksa
-        if (word.length > maxLength) {
+        if (word.length > maxLength * 0.6) {
           let remainingWord = word;
-          while (remainingWord.length > maxLength) {
-            chunks.push(remainingWord.substring(0, maxLength));
-            remainingWord = remainingWord.substring(maxLength);
+          while (remainingWord.length > maxLength * 0.6) {
+            chunks.push(remainingWord.substring(0, Math.floor(maxLength * 0.6)));
+            remainingWord = remainingWord.substring(Math.floor(maxLength * 0.6));
           }
           currentChunk = remainingWord;
         } else {
           currentChunk = word;
+        }
+      }
+    }
+    
+    // Tambahkan chunk terakhir
+    if (currentChunk.trim()) {
+      chunks.push(currentChunk.trim());
+    }
+    
+    return chunks;
+  }
+
+  // Helper method untuk force split text yang terlalu besar
+  forceSplit(text, maxLength) {
+    const chunks = [];
+    const lines = text.split('\n');
+    let currentChunk = '';
+    
+    for (const line of lines) {
+      const potentialChunk = currentChunk ? currentChunk + '\n' + line : line;
+      
+      if (potentialChunk.length <= maxLength) {
+        currentChunk = potentialChunk;
+      } else {
+        // Simpan chunk saat ini
+        if (currentChunk.trim()) {
+          chunks.push(currentChunk.trim());
+        }
+        
+        // Jika line terlalu panjang, split berdasarkan kata
+        if (line.length > maxLength) {
+          const words = line.split(' ');
+          let lineChunk = '';
+          
+          for (const word of words) {
+            const potentialLine = lineChunk ? lineChunk + ' ' + word : word;
+            
+            if (potentialLine.length <= maxLength) {
+              lineChunk = potentialLine;
+            } else {
+              if (lineChunk.trim()) {
+                chunks.push(lineChunk.trim());
+              }
+              
+              // Jika kata terlalu panjang, potong paksa
+              if (word.length > maxLength) {
+                let remainingWord = word;
+                while (remainingWord.length > maxLength) {
+                  chunks.push(remainingWord.substring(0, maxLength));
+                  remainingWord = remainingWord.substring(maxLength);
+                }
+                lineChunk = remainingWord;
+              } else {
+                lineChunk = word;
+              }
+            }
+          }
+          
+          currentChunk = lineChunk;
+        } else {
+          currentChunk = line;
         }
       }
     }

@@ -52,16 +52,13 @@ Halo ${ctx.from.first_name}! Saya adalah chatbot yang menggunakan Google Gemini 
 
 *Fitur yang tersedia:*
 🧠 Chat dengan AI yang mengingat percakapan
-⚙️ Pilih model AI yang diinginkan
-📝 Atur system prompt personal
+⚙️ Konfigurasi otomatis dari environment
+🤖 Model AI yang telah dikonfigurasi
 📊 Lihat statistik penggunaan
 🗑️ Hapus riwayat percakapan
 
 *Perintah yang tersedia:*
 /help - Bantuan lengkap
-/models - Lihat model yang tersedia
-/model [nama] - Ganti model AI
-/prompt [teks] - Atur system prompt
 /clear - Hapus riwayat percakapan
 /stats - Lihat statistik Anda
 /settings - Pengaturan akun
@@ -88,16 +85,6 @@ Silakan mulai chat dengan mengirim pesan apapun!
 /help - Tampilkan panduan ini
 /ping - Cek status bot dan koneksi
 
-*Pengaturan Model:*
-/models - Lihat semua model tersedia
-/model flash - Gunakan Gemini 1.5 Flash (cepat)
-/model pro - Gunakan Gemini 1.5 Pro (canggih)
-
-*Pengaturan Prompt:*
-/prompt - Lihat system prompt saat ini
-/prompt [teks] - Atur system prompt baru
-/prompt reset - Reset ke prompt default
-
 *Manajemen Data:*
 /clear - Hapus semua riwayat percakapan
 /stats - Lihat statistik penggunaan
@@ -114,91 +101,6 @@ Jika ada masalah, coba /ping untuk cek status bot.
       `;
 
       await this.sendLongMessage(ctx, helpMessage);
-    });
-
-    // Models command
-    this.bot.command('models', async (ctx) => {
-      const models = geminiService.getAvailableModels();
-      const user = await database.getOrCreateUser(ctx.from);
-      const settings = await database.getUserSettings(user.id);
-      const currentModel = settings?.preferred_model || process.env.GEMINI_MODEL || 'gemini-1.5-flash';
-
-      let message = `🤖 *Model AI yang Tersedia:*\n\n`;
-      
-      models.forEach(model => {
-        const isCurrent = model.name === currentModel ? '✅ ' : '';
-        message += `${isCurrent}*${model.name}*\n${model.description}\n\n`;
-      });
-
-      message += `*Model saat ini:* ${currentModel}\n\n`;
-      message += `Untuk mengganti model, gunakan:\n/model [nama_model]`;
-
-      await this.sendLongMessage(ctx, message);
-    });
-
-    // Model command
-    this.bot.command('model', async (ctx) => {
-      const args = ctx.message.text.split(' ').slice(1);
-      
-      if (args.length === 0) {
-        const user = await database.getOrCreateUser(ctx.from);
-        const settings = await database.getUserSettings(user.id);
-        const currentModel = settings?.preferred_model || process.env.GEMINI_MODEL || 'gemini-1.5-flash';
-        
-        await ctx.reply(`Model saat ini: *${currentModel}*\n\nGunakan /models untuk melihat pilihan model.`, { parse_mode: 'Markdown' });
-        return;
-      }
-
-      const modelName = args.join(' ').toLowerCase();
-      const modelMap = {
-        'flash': 'gemini-1.5-flash',
-        'pro': 'gemini-1.5-pro',
-        '1.0': 'gemini-1.0-pro',
-        'gemini-1.5-flash': 'gemini-1.5-flash',
-        'gemini-1.5-pro': 'gemini-1.5-pro',
-        'gemini-1.0-pro': 'gemini-1.0-pro'
-      };
-
-      const selectedModel = modelMap[modelName];
-      
-      if (!selectedModel || !geminiService.isValidModel(selectedModel)) {
-        await ctx.reply('❌ Model tidak valid. Gunakan /models untuk melihat model yang tersedia.');
-        return;
-      }
-
-      const user = await database.getOrCreateUser(ctx.from);
-      await database.updateUserSettings(user.id, { preferred_model: selectedModel });
-
-      await ctx.reply(`✅ Model berhasil diubah ke *${selectedModel}*`, { parse_mode: 'Markdown' });
-    });
-
-    // Prompt command
-    this.bot.command('prompt', async (ctx) => {
-      const args = ctx.message.text.split(' ').slice(1);
-      const user = await database.getOrCreateUser(ctx.from);
-
-      if (args.length === 0) {
-        const settings = await database.getUserSettings(user.id);
-        const currentPrompt = settings?.system_prompt || process.env.SYSTEM_PROMPT || 'You are a helpful AI assistant.';
-        
-        await this.sendLongMessage(ctx, `📝 *System Prompt saat ini:*\n\n\`${currentPrompt}\`\n\nGunakan /prompt [teks] untuk mengubah atau /prompt reset untuk reset.`);
-        return;
-      }
-
-      if (args[0].toLowerCase() === 'reset') {
-        await database.updateUserSettings(user.id, { system_prompt: null });
-        await ctx.reply('✅ System prompt berhasil direset ke default.');
-        return;
-      }
-
-      const newPrompt = args.join(' ');
-      if (newPrompt.length > 500) {
-        await ctx.reply('❌ System prompt terlalu panjang. Maksimal 500 karakter.');
-        return;
-      }
-
-      await database.updateUserSettings(user.id, { system_prompt: newPrompt });
-      await ctx.reply('✅ System prompt berhasil diubah.');
     });
 
     // Clear command
@@ -238,12 +140,11 @@ Jika ada masalah, coba /ping untuk cek status bot.
         message += `\n`;
       }
 
-      const currentModel = settings?.preferred_model || process.env.GEMINI_MODEL || 'gemini-1.5-flash';
-      const currentPrompt = settings?.system_prompt ? 'Custom' : 'Default';
+      const currentModel = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
       
-      message += `⚙️ *Pengaturan Saat Ini:*\n`;
-      message += `• Model: ${currentModel}\n`;
-      message += `• System Prompt: ${currentPrompt}`;
+      message += `⚙️ *Konfigurasi Bot:*\n`;
+      message += `• Model: ${currentModel} (fixed)\n`;
+      message += `• System Prompt: Default (fixed)`;
 
       await this.sendLongMessage(ctx, message);
     });
@@ -251,23 +152,19 @@ Jika ada masalah, coba /ping untuk cek status bot.
     // Settings command
     this.bot.command('settings', async (ctx) => {
       const user = await database.getOrCreateUser(ctx.from);
-      const settings = await database.getUserSettings(user.id);
       
       const keyboard = Markup.inlineKeyboard([
-        [Markup.button.callback('🤖 Ubah Model', 'settings_model')],
-        [Markup.button.callback('📝 Ubah Prompt', 'settings_prompt')],
         [Markup.button.callback('🗑️ Hapus Riwayat', 'settings_clear')],
         [Markup.button.callback('📊 Lihat Stats', 'settings_stats')]
       ]);
 
-      const currentModel = settings?.preferred_model || process.env.GEMINI_MODEL || 'gemini-1.5-flash';
-      const promptType = settings?.system_prompt ? 'Custom' : 'Default';
+      const currentModel = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
 
       const message = `⚙️ *Pengaturan Akun*\n\n` +
-                     `🤖 Model: ${currentModel}\n` +
-                     `📝 System Prompt: ${promptType}\n` +
+                     `🤖 Model: ${currentModel} (fixed dari environment)\n` +
+                     `📝 System Prompt: Default (fixed dari environment)\n` +
                      `👤 User ID: ${user.id}\n\n` +
-                     `Pilih pengaturan yang ingin diubah:`;
+                     `Pilih pengaturan yang tersedia:`;
 
       await this.sendLongMessage(ctx, message, { reply_markup: keyboard.reply_markup });
     });
@@ -333,11 +230,10 @@ Jika ada masalah, coba /ping untuk cek status bot.
         // Show typing indicator
         await ctx.sendChatAction('typing');
 
-        // Get user settings
-        const settings = await database.getUserSettings(user.id);
-        const preferredModel = settings?.preferred_model || process.env.GEMINI_MODEL || 'gemini-1.5-flash';
-        const systemPrompt = settings?.system_prompt || null;
-        const maxContext = settings?.max_context_messages || parseInt(process.env.MAX_CONTEXT_MESSAGES) || 20;
+        // Use settings from environment (no user customization)
+        const preferredModel = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+        const systemPrompt = null; // Always use default from environment
+        const maxContext = parseInt(process.env.MAX_CONTEXT_MESSAGES) || 20;
 
         // Get conversation history
         const conversationHistory = await conversationService.getRecentContextForAI(user.id, maxContext);
@@ -375,10 +271,10 @@ Jika ada masalah, coba /ping untuk cek status bot.
 
       switch (action) {
         case 'settings_model':
-          await ctx.reply('Gunakan perintah /models untuk melihat dan /model [nama] untuk mengganti model.');
+          await ctx.reply('Model AI telah dikonfigurasi dari environment dan tidak dapat diubah.');
           break;
         case 'settings_prompt':
-          await ctx.reply('Gunakan /prompt untuk melihat dan /prompt [teks] untuk mengubah system prompt.');
+          await ctx.reply('System prompt telah dikonfigurasi dari environment dan tidak dapat diubah.');
           break;
         case 'settings_clear':
           await ctx.reply('Gunakan /clear untuk menghapus riwayat percakapan.');
